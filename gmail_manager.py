@@ -72,12 +72,15 @@ def get_email_stats(service, age_range: str = 'recent') -> List[Tuple[str, int, 
             ("old", "older_than:1y newer_than:13m")  # 12-13 months ago
         ]
     
+    # Use a set to track unique message IDs
+    message_ids_seen = set()
     all_messages = []
+    
     for period_name, period_query in periods:
         rprint(f"[yellow]Sampling {period_name} messages...[/yellow]")
-        # Add search for common newsletter and unsubscribe patterns
+        # First try with unsubscribe patterns
         unsubscribe_query = (
-            f'{period_query} '
+            f'in:inbox {period_query} '  # Only look at inbox emails
             '-from:{user_email} '
             '(subject:"unsubscribe" OR '
             'subject:"subscription" OR '
@@ -96,7 +99,28 @@ def get_email_stats(service, age_range: str = 'recent') -> List[Tuple[str, int, 
         ).execute()
         
         if 'messages' in results:
-            all_messages.extend(results.get('messages', []))
+            # Only add messages we haven't seen before
+            for msg in results.get('messages', []):
+                if msg['id'] not in message_ids_seen:
+                    message_ids_seen.add(msg['id'])
+                    all_messages.append(msg)
+        
+        # If we didn't get enough messages, try without unsubscribe patterns
+        if len(all_messages) < 100:  # arbitrary threshold
+            basic_query = f'in:inbox {period_query} -from:{user_email}'  # Only look at inbox emails
+            results = service.users().messages().list(
+                userId='me', 
+                maxResults=167,  # Roughly 500/3 messages per period
+                q=basic_query,
+                fields='messages/id,nextPageToken'
+            ).execute()
+            
+            if 'messages' in results:
+                # Only add messages we haven't seen before
+                for msg in results.get('messages', []):
+                    if msg['id'] not in message_ids_seen:
+                        message_ids_seen.add(msg['id'])
+                        all_messages.append(msg)
             
     if not all_messages:
         return []
@@ -118,9 +142,9 @@ def get_email_stats(service, age_range: str = 'recent') -> List[Tuple[str, int, 
             if exception is None and 'payload' in response:
                 headers = response['payload']['headers']
                 from_header = next((h['value'] for h in headers if h['name'].lower() == 'from'), None)
-                # Check for List-Unsubscribe header
+                # Check for List-Unsubscribe header but don't require it
                 has_unsubscribe = any(h['name'].lower() == 'list-unsubscribe' for h in headers)
-                if from_header and has_unsubscribe:
+                if from_header:  # Accept all senders now
                     if from_header not in sender_stats:
                         sender_stats[from_header] = []
                     sender_stats[from_header].append(request_id)
@@ -131,7 +155,7 @@ def get_email_stats(service, age_range: str = 'recent') -> List[Tuple[str, int, 
                     userId='me',
                     id=msg['id'],
                     format='metadata',
-                    metadataHeaders=['From', 'List-Unsubscribe']  # Also fetch List-Unsubscribe header
+                    metadataHeaders=['From', 'List-Unsubscribe']
                 ),
                 callback=callback,
                 request_id=msg['id']
@@ -185,6 +209,66 @@ def get_message_body(message: dict) -> str:
             
     return body or "No readable message body found."
 
+def adaptive_batch_move(service, messages: list, operation_name: str = "messages") -> None:
+    """Moves messages to trash with adaptive batch sizing."""
+    if not messages:
+        return
+        
+    total = len(messages)
+    rprint(f"[yellow]Moving {total} {operation_name} to trash...[/yellow]")
+    
+    # Start with an aggressive batch size
+    batch_size = 500
+    min_batch_size = 50  # Don't go below this
+    processed = 0
+    consecutive_successes = 0
+    consecutive_failures = 0
+    
+    while processed < total:
+        try:
+            end_idx = min(processed + batch_size, total)
+            batch = messages[processed:end_idx]
+            
+            service.users().messages().batchModify(
+                userId='me',
+                body={
+                    'ids': [msg['id'] for msg in batch],
+                    'addLabelIds': ['TRASH']
+                }
+            ).execute()
+            
+            batch_processed = len(batch)
+            processed += batch_processed
+            consecutive_successes += 1
+            consecutive_failures = 0
+            
+            # Print progress first
+            rprint(f"Progress: {processed}/{total} {operation_name} moved to trash (batch size: {batch_size})", end="\r")
+            
+            # If we've had several successes, try increasing batch size
+            if consecutive_successes >= 3 and batch_size < 1000:
+                old_size = batch_size
+                batch_size = min(batch_size * 2, 1000)
+                if old_size != batch_size:
+                    rprint(f"\n[green]Increasing batch size to {batch_size}[/green]")
+            
+        except Exception as e:
+            consecutive_failures += 1
+            consecutive_successes = 0
+            
+            # Reduce batch size on failure
+            old_size = batch_size
+            batch_size = max(batch_size // 2, min_batch_size)
+            rprint(f"\n[red]Error with batch size {old_size}: {str(e)}[/red]")
+            rprint(f"[yellow]Reducing batch size to {batch_size} and retrying...[/yellow]")
+            
+            # If we've failed multiple times at minimum batch size, give up
+            if consecutive_failures >= 3 and batch_size == min_batch_size:
+                rprint(f"[red]Too many failures even at minimum batch size. Stopping.[/red]")
+                break
+                
+    rprint(f"\n[green]Finished moving {processed} out of {total} {operation_name} to trash![/green]")
+
 def move_to_trash(service, sender: str):
     """Moves all emails from a sender to trash."""
     # Extract email address from sender string if it contains one
@@ -219,32 +303,7 @@ def move_to_trash(service, sender: str):
         rprint("[yellow]No messages found for this sender.[/yellow]")
         return
         
-    total = len(messages)
-    rprint(f"[yellow]Moving {total} messages to trash...[/yellow]")
-    
-    # Process in smaller batches of 100 messages
-    batch_size = 100
-    had_errors = False
-    for i in range(0, len(messages), batch_size):
-        try:
-            batch = messages[i:i + batch_size]
-            service.users().messages().batchModify(
-                userId='me',
-                body={
-                    'ids': [msg['id'] for msg in batch],
-                    'addLabelIds': ['TRASH']
-                }
-            ).execute()
-            rprint(f"Progress: {min(i + batch_size, total)}/{total} messages moved to trash", end="\r")
-        except Exception as e:
-            had_errors = True
-            rprint(f"\n[red]Error moving batch to trash: {str(e)}[/red]")
-            rprint("[yellow]Continuing with next batch...[/yellow]")
-            continue
-            
-    rprint(f"\n[green]Finished moving messages to trash![/green]")
-    if had_errors:
-        rprint(f"[yellow]Note: Some batches failed. Please refresh the list to verify.[/yellow]")
+    adaptive_batch_move(service, messages, f"emails from {email_address}")
 
 def empty_trash(service):
     """Permanently deletes all messages in the trash."""
@@ -289,6 +348,157 @@ def empty_trash(service):
     except Exception as e:
         rprint(f"[red]Error emptying trash: {str(e)}[/red]")
 
+def move_category_to_trash(service, category: str):
+    """Moves all emails from a category to trash."""
+    query = f'category:{category.lower()}'
+    rprint(f"[yellow]Moving emails from category: {category} to trash...[/yellow]")
+    
+    messages = []
+    next_page_token = None
+    
+    # Keep fetching pages until we have all messages
+    while True:
+        results = service.users().messages().list(
+            userId='me', 
+            q=query,
+            pageToken=next_page_token,
+            fields='messages/id,nextPageToken'
+        ).execute()
+        
+        if 'messages' in results:
+            messages.extend(results['messages'])
+            
+        next_page_token = results.get('nextPageToken')
+        if not next_page_token:
+            break
+    
+    if not messages:
+        rprint("[yellow]No messages found in this category.[/yellow]")
+        return
+        
+    adaptive_batch_move(service, messages, f"emails from category {category}")
+
+def handle_category_menu(service, current_age_range: str):
+    """Handles the category menu operations."""
+    # Standard Gmail categories
+    categories = ['Primary', 'Social', 'Promotions', 'Updates', 'Forums']
+    
+    # Display categories
+    table = Table(title="Gmail Categories")
+    table.add_column("#", justify="right", style="cyan")
+    table.add_column("Category", style="green")
+    
+    for idx, category in enumerate(categories, 1):
+        table.add_row(str(idx), category)
+    
+    console.print(table)
+    
+    # Ask if user wants to move any category to trash
+    action = input("\nEnter category number to move to trash (or Enter to continue): ").strip()
+    if action and action.isdigit():
+        category_num = int(action)
+        if 1 <= category_num <= len(categories):
+            category = categories[category_num - 1]
+            confirm = input(f"Are you sure you want to move all emails from {category} to trash? (y/N): ")
+            if confirm.lower() == 'y':
+                move_category_to_trash(service, category)
+
+def adaptive_batch_archive(service, messages: list, operation_name: str = "messages") -> None:
+    """Archives messages with adaptive batch sizing."""
+    if not messages:
+        return
+        
+    total = len(messages)
+    rprint(f"[yellow]Archiving {total} {operation_name}...[/yellow]")
+    
+    # Start with an aggressive batch size
+    batch_size = 500
+    min_batch_size = 50  # Don't go below this
+    processed = 0
+    consecutive_successes = 0
+    consecutive_failures = 0
+    
+    while processed < total:
+        try:
+            end_idx = min(processed + batch_size, total)
+            batch = messages[processed:end_idx]
+            
+            service.users().messages().batchModify(
+                userId='me',
+                body={
+                    'ids': [msg['id'] for msg in batch],
+                    'removeLabelIds': ['INBOX']  # Removing INBOX label archives the message
+                }
+            ).execute()
+            
+            batch_processed = len(batch)
+            processed += batch_processed
+            consecutive_successes += 1
+            consecutive_failures = 0
+            
+            # Print progress first
+            rprint(f"Progress: {processed}/{total} {operation_name} archived (batch size: {batch_size})", end="\r")
+            
+            # If we've had several successes, try increasing batch size
+            if consecutive_successes >= 3 and batch_size < 1000:
+                old_size = batch_size
+                batch_size = min(batch_size * 2, 1000)
+                if old_size != batch_size:
+                    rprint(f"\n[green]Increasing batch size to {batch_size}[/green]")
+            
+        except Exception as e:
+            consecutive_failures += 1
+            consecutive_successes = 0
+            
+            # Reduce batch size on failure
+            old_size = batch_size
+            batch_size = max(batch_size // 2, min_batch_size)
+            rprint(f"\n[red]Error with batch size {old_size}: {str(e)}[/red]")
+            rprint(f"[yellow]Reducing batch size to {batch_size} and retrying...[/yellow]")
+            
+            # If we've failed multiple times at minimum batch size, give up
+            if consecutive_failures >= 3 and batch_size == min_batch_size:
+                rprint(f"[red]Too many failures even at minimum batch size. Stopping.[/red]")
+                break
+                
+    rprint(f"\n[green]Finished archiving {processed} out of {total} {operation_name}![/green]")
+
+def archive_emails(service, sender: str):
+    """Archives all emails from a sender."""
+    # Extract email address from sender string if it contains one
+    if '<' in sender and '>' in sender:
+        email_address = sender[sender.find('<')+1:sender.find('>')]
+    else:
+        email_address = sender
+
+    query = f'from:{email_address} in:inbox'  # Only archive emails that are in inbox
+    rprint(f"[yellow]Searching for emails from: {email_address}[/yellow]")
+    
+    messages = []
+    next_page_token = None
+    
+    # Keep fetching pages until we have all messages
+    while True:
+        results = service.users().messages().list(
+            userId='me', 
+            q=query,
+            pageToken=next_page_token,
+            fields='messages/id,nextPageToken'  # Only get what we need
+        ).execute()
+        
+        if 'messages' in results:
+            messages.extend(results['messages'])
+            
+        next_page_token = results.get('nextPageToken')
+        if not next_page_token:
+            break
+    
+    if not messages:
+        rprint("[yellow]No messages found in inbox for this sender.[/yellow]")
+        return
+        
+    adaptive_batch_archive(service, messages, f"emails from {email_address}")
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Gmail Manager - Analyze and clean up your Gmail inbox')
@@ -319,7 +529,9 @@ def main():
         rprint("1-10: View emails from sender")
         rprint("D: Delete all emails from a sender")
         rprint("M: Delete emails from multiple senders")
+        rprint("A: Archive emails from multiple senders")
         rprint("R: Refresh list")
+        rprint("C: Manage categories")
         rprint("Q: Quit")
         
         choice = input("\nEnter your choice: ").strip()
@@ -395,6 +607,56 @@ def main():
                             break
             except ValueError:
                 rprint("[red]Please enter valid numbers or 'ALL' with optional exclusions (e.g., 'ALL -1 -2').[/red]")
+            continue
+            
+        if choice.lower() == 'a':
+            try:
+                input_str = input("Enter sender numbers (1-10 or 'ALL' or 'ALL -1 -2' to exclude): ").strip()
+                selected_senders = []
+                
+                if input_str.upper().startswith('ALL'):
+                    # Get all numbers except those prefixed with '-'
+                    excluded = {abs(int(n)) for n in input_str.split()[1:] if n.startswith('-')}
+                    selected_senders = [
+                        sender_stats[i][0] for i in range(len(sender_stats))
+                        if i + 1 not in excluded
+                    ]
+                else:
+                    # Process individual numbers
+                    numbers = input_str.split()
+                    # Validate all numbers before proceeding
+                    for num in numbers:
+                        sender_num = int(num)
+                        if 1 <= sender_num <= len(sender_stats):
+                            selected_senders.append(sender_stats[sender_num - 1][0])
+                        else:
+                            rprint(f"[red]Invalid sender number: {num}[/red]")
+                            selected_senders = []
+                            break
+                
+                if selected_senders:
+                    # Show summary of selected senders
+                    rprint("\n[yellow]Selected senders:[/yellow]")
+                    for sender in selected_senders:
+                        rprint(f"- {sender}")
+                    
+                    confirm = input(f"\nAre you sure you want to archive all emails from these {len(selected_senders)} senders? (y/N): ")
+                    if confirm.lower() == 'y':
+                        for sender in selected_senders:
+                            rprint(f"\n[yellow]Processing {sender}...[/yellow]")
+                            archive_emails(service, sender)
+                        
+                        # Refresh stats after all archives
+                        sender_stats = get_email_stats(service, age_range=args.age)
+                        if not sender_stats:
+                            rprint("[yellow]No more senders in the list![/yellow]")
+                            break
+            except ValueError:
+                rprint("[red]Please enter valid numbers or 'ALL' with optional exclusions (e.g., 'ALL -1 -2').[/red]")
+            continue
+            
+        if choice.lower() == 'c':
+            handle_category_menu(service, args.age)
             continue
             
         # Handle viewing emails for a sender
