@@ -49,7 +49,7 @@ Analysis complete!
                                        Top Email Senders                                        
 ┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┓
 ┃  # ┃ Sender                                                     ┃ Sample Count ┃ % of Sample ┃
-┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━━┩
 │  1 │ Glassdoor Jobs <noreply@glassdoor.com>                     │           12 │        2.4% │
 │  2 │ LinkedIn Job Alerts <jobalerts-noreply@linkedin.com>       │           10 │        2.0% │
 │  3 │ Reddit <noreply@redditmail.com>                            │            8 │        1.6% │
