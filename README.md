@@ -53,7 +53,7 @@ Analysis complete!
 │  1 │ Glassdoor Jobs <noreply@glassdoor.com>                     │           12 │        2.4% │
 │  2 │ LinkedIn Job Alerts <jobalerts-noreply@linkedin.com>       │           10 │        2.0% │
 │  3 │ Reddit <noreply@redditmail.com>                            │            8 │        1.6% │
-│  4 │ MIT Technology Review <promotions@technologyreview.com>     │            7 │        1.4% │
+│  4 │ MIT Technology Review <promotions@technologyreview.com>    │            7 │        1.4% │
 │  5 │ The Feed <hello@thefeed.com>                               │            7 │        1.4% │
 │  6 │ Ministry of Supply <hello@ministryofsupply.com>            │            6 │        1.2% │
 │  7 │ ZINIO <zinio@discover.zinio.com>                           │            6 │        1.2% │
